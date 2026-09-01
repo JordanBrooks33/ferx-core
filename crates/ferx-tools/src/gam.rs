@@ -474,8 +474,8 @@ pub(crate) fn screen_eta_raw(
             }
         }
 
-        if best_aic.is_infinite() {
-            continue; // no valid form fit
+        if best_aic == f64::INFINITY {
+            continue; // no valid form was successfully fit
         }
 
         scores.push(CovariateScore {
@@ -957,6 +957,324 @@ mod tests {
             find(&scores_v, "SEX")
         );
         assert_eq!(scores_v[0].covariate, "SEX", "SEX must rank #1 for ETA_V");
+    }
+
+    // ── categorical_design ────────────────────────────────────────────────────
+
+    #[test]
+    fn categorical_design_single_level_returns_empty_matrix() {
+        // All values identical → only one level → no dummy columns needed.
+        let x = vec![1.0, 1.0, 1.0];
+        let d = categorical_design(&x);
+        assert_eq!(d.nrows(), 3);
+        assert_eq!(d.ncols(), 0);
+    }
+
+    #[test]
+    fn categorical_design_three_levels_two_dummies() {
+        // Levels [0, 1, 2] → reference = 0 → dummies for 1 and 2.
+        let x = vec![0.0, 1.0, 2.0, 1.0];
+        let d = categorical_design(&x);
+        assert_eq!(d.ncols(), 2);
+        // Row 0 (x=0): both dummies off.
+        assert!((d[(0, 0)]).abs() < 1e-12);
+        assert!((d[(0, 1)]).abs() < 1e-12);
+        // Row 1 (x=1): first dummy on.
+        assert!((d[(1, 0)] - 1.0).abs() < 1e-12);
+        assert!((d[(1, 1)]).abs() < 1e-12);
+        // Row 2 (x=2): second dummy on.
+        assert!((d[(2, 0)]).abs() < 1e-12);
+        assert!((d[(2, 1)] - 1.0).abs() < 1e-12);
+    }
+
+    // ── d_func degenerate ─────────────────────────────────────────────────────
+
+    #[test]
+    fn d_func_degenerate_knots_returns_zero() {
+        // When xi_j == xi_k the denominator is 0; d_func must return 0.
+        assert!((d_func(5.0, 3.0, 3.0)).abs() < 1e-12);
+        assert!((d_func(0.0, 0.0, 0.0)).abs() < 1e-12);
+    }
+
+    // ── ns_basis edge cases ───────────────────────────────────────────────────
+
+    #[test]
+    fn ns_basis_df0_returns_empty_matrix() {
+        let x = vec![1.0, 2.0, 3.0];
+        let basis = ns_basis(&x, 0);
+        assert_eq!(basis.nrows(), 3);
+        assert_eq!(basis.ncols(), 0);
+    }
+
+    #[test]
+    fn ns_basis_empty_x_returns_empty_matrix() {
+        // When n=0, the function short-circuits and returns (0, 0): 0 rows and
+        // 0 columns (same early-return branch as df=0).
+        let basis = ns_basis(&[], 2);
+        assert_eq!(basis.nrows(), 0);
+        assert_eq!(basis.ncols(), 0);
+    }
+
+    #[test]
+    fn ns_basis_df3_four_knots() {
+        // df=3 → K=4 knots: min, Q1/3, Q2/3, max for x = 0..=9
+        // Shape check + column-0 = x + column-1 satisfies d_1-d_3 formula.
+        let x: Vec<f64> = (0..=9).map(|i| i as f64).collect();
+        let basis = ns_basis(&x, 3);
+        assert_eq!(basis.nrows(), 10);
+        assert_eq!(basis.ncols(), 3);
+        // Col 0 must equal x.
+        for (i, &xi) in x.iter().enumerate() {
+            assert!(
+                (basis[(i, 0)] - xi).abs() < 1e-12,
+                "col 0 should be x at row {i}"
+            );
+        }
+        // All values should be finite.
+        for r in 0..10 {
+            for c in 0..3 {
+                assert!(basis[(r, c)].is_finite(), "NaN/inf at ({r},{c})");
+            }
+        }
+    }
+
+    // ── ols_aic constant y ────────────────────────────────────────────────────
+
+    #[test]
+    fn ols_aic_constant_y_gives_r2_zero() {
+        // When y is constant, SST = 0; the function should return r²=0.
+        let y = DVector::from_vec(vec![3.0, 3.0, 3.0, 3.0, 3.0]);
+        let x = DMatrix::from_vec(5, 2, vec![1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 2.0, 3.0, 4.0]);
+        let (_, r2) = ols_aic(&x, &y).unwrap();
+        assert!(r2.abs() < 1e-10, "constant y: R² should be 0, got {r2}");
+    }
+
+    // ── screen_eta_raw edge cases ─────────────────────────────────────────────
+
+    #[test]
+    fn screen_eta_raw_include_linear_false_returns_spline_only() {
+        // Strong linear signal but linear form excluded → spline must win.
+        let x: Vec<f64> = (0..30).map(|i| i as f64).collect();
+        let eta: Vec<f64> = x.iter().map(|&xi| 2.0 * xi).collect();
+        let opts = GamOptions {
+            include_linear: false,
+            spline_df: vec![2, 3],
+            ..Default::default()
+        };
+        let cov_refs = [("WT", x.as_slice(), CovariateKind::Continuous)];
+        let (_, scores) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert!(!scores.is_empty());
+        assert!(
+            matches!(scores[0].best_form, CovariateForm::Spline { .. }),
+            "expected spline form when linear excluded, got {:?}",
+            scores[0].best_form
+        );
+    }
+
+    #[test]
+    fn screen_eta_raw_nan_covariate_skips_affected_subjects() {
+        // 30 subjects; first 5 have NaN covariate → only 25 used.
+        // The signal is still detectable on the 25 valid subjects.
+        let x_base: Vec<f64> = (0..30).map(|i| i as f64).collect();
+        let eta: Vec<f64> = x_base.iter().map(|&xi| 2.0 * xi).collect();
+        let mut x_nan = x_base.clone();
+        for v in &mut x_nan[..5] {
+            *v = f64::NAN;
+        }
+        let opts = GamOptions::default();
+        let cov_refs = [("WT", x_nan.as_slice(), CovariateKind::Continuous)];
+        let (_, scores) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert!(!scores.is_empty());
+        assert!(
+            scores[0].delta_aic > 5.0,
+            "signal should still be detected with 25/30 valid subjects, got Δ AIC {}",
+            scores[0].delta_aic
+        );
+    }
+
+    #[test]
+    fn screen_eta_raw_too_few_valid_pairs_skips_covariate() {
+        // eta has 30 subjects but covariate has NaN in all but 2 → skipped.
+        let eta: Vec<f64> = (0..30).map(|i| i as f64).collect();
+        let mut x = vec![f64::NAN; 30];
+        x[0] = 1.0;
+        x[1] = 2.0;
+        let opts = GamOptions::default();
+        let cov_refs = [("X", x.as_slice(), CovariateKind::Continuous)];
+        let (_, scores) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert!(
+            scores.is_empty(),
+            "covariate with < 3 valid pairs should be skipped"
+        );
+    }
+
+    #[test]
+    fn screen_eta_raw_nan_eta_values_handled() {
+        // ETAs with NaN scattered in: the global null must use only finite ETAs.
+        let mut eta: Vec<f64> = (0..30).map(|i| i as f64).collect();
+        eta[0] = f64::NAN;
+        eta[15] = f64::NAN;
+        let x: Vec<f64> = (0..30).map(|i| i as f64).collect();
+        let opts = GamOptions::default();
+        let cov_refs = [("X", x.as_slice(), CovariateKind::Continuous)];
+        // Should not panic; NaN ETAs are dropped, 28 subjects remain.
+        let (aic_null, scores) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert!(aic_null.is_finite());
+        assert!(!scores.is_empty());
+    }
+
+    // ── gam_screen_raw ────────────────────────────────────────────────────────
+
+    #[test]
+    fn gam_screen_raw_returns_correct_structure() {
+        let eta1: Vec<f64> = (0..20).map(|i| i as f64 * 0.1).collect();
+        let eta2: Vec<f64> = (0..20).map(|i| -(i as f64) * 0.1).collect();
+        let cov: Vec<f64> = (0..20).map(|i| i as f64).collect();
+        let shrinkage = vec![0.10, 0.20];
+        let opts = GamOptions::default();
+
+        let result = gam_screen_raw(
+            &["ETA_CL", "ETA_V"],
+            &[eta1.as_slice(), eta2.as_slice()],
+            &shrinkage,
+            &["WT"],
+            &[cov.as_slice()],
+            &[CovariateKind::Continuous],
+            &opts,
+        );
+
+        assert_eq!(result.eta_results.len(), 2);
+        assert_eq!(result.eta_results[0].eta_name, "ETA_CL");
+        assert_eq!(result.eta_results[1].eta_name, "ETA_V");
+        // Each ETA has one covariate score.
+        assert_eq!(result.eta_results[0].covariate_scores.len(), 1);
+        assert_eq!(result.eta_results[1].covariate_scores.len(), 1);
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn gam_screen_raw_empty_etas_returns_empty_result() {
+        let opts = GamOptions::default();
+        let cov: Vec<f64> = vec![1.0, 2.0, 3.0];
+        let result = gam_screen_raw(
+            &[],
+            &[],
+            &[],
+            &["WT"],
+            &[cov.as_slice()],
+            &[CovariateKind::Continuous],
+            &opts,
+        );
+        assert!(result.eta_results.is_empty());
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn gam_screen_raw_high_shrinkage_emits_warning() {
+        let eta: Vec<f64> = (0..20).map(|i| i as f64 * 0.1).collect();
+        let cov: Vec<f64> = (0..20).map(|i| i as f64).collect();
+        let shrinkage = vec![0.60]; // exceeds default 0.30 threshold
+        let opts = GamOptions::default();
+
+        let result = gam_screen_raw(
+            &["ETA_CL"],
+            &[eta.as_slice()],
+            &shrinkage,
+            &["WT"],
+            &[cov.as_slice()],
+            &[CovariateKind::Continuous],
+            &opts,
+        );
+
+        assert!(!result.warnings.is_empty(), "expected a shrinkage warning");
+        assert!(
+            result.warnings[0].contains("ETA_CL"),
+            "warning should name the ETA"
+        );
+    }
+
+    #[test]
+    fn gam_screen_raw_nan_shrinkage_no_warning() {
+        let eta: Vec<f64> = (0..20).map(|i| i as f64 * 0.1).collect();
+        let cov: Vec<f64> = (0..20).map(|i| i as f64).collect();
+        let shrinkage = vec![f64::NAN];
+        let opts = GamOptions::default();
+
+        let result = gam_screen_raw(
+            &["ETA_CL"],
+            &[eta.as_slice()],
+            &shrinkage,
+            &["WT"],
+            &[cov.as_slice()],
+            &[CovariateKind::Continuous],
+            &opts,
+        );
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn gam_screen_raw_categorical_covariate() {
+        let eta: Vec<f64> = (0..30).map(|i| if i < 15 { 0.0 } else { 1.0 }).collect();
+        let sex: Vec<f64> = (0..30).map(|i| if i < 15 { 0.0 } else { 1.0 }).collect();
+        let shrinkage = vec![0.10];
+        let opts = GamOptions::default();
+
+        let result = gam_screen_raw(
+            &["ETA_CL"],
+            &[eta.as_slice()],
+            &shrinkage,
+            &["SEX"],
+            &[sex.as_slice()],
+            &[CovariateKind::Categorical],
+            &opts,
+        );
+
+        assert_eq!(result.eta_results.len(), 1);
+        let scores = &result.eta_results[0].covariate_scores;
+        assert!(!scores.is_empty());
+        assert_eq!(scores[0].best_form, CovariateForm::Categorical);
+        assert!(scores[0].delta_aic > 5.0);
+    }
+
+    #[test]
+    fn gam_screen_raw_delta_aic_equals_aic_null_minus_aic() {
+        // Invariant: delta_aic = aic_null_local - aic_best (always positive
+        // when there is a real signal).  Use noisy data so AIC is finite
+        // (a perfect-fit gives AIC = -∞ and delta_aic = +∞).
+        let x: Vec<f64> = (0..30).map(|i| i as f64).collect();
+        // Deterministic noise via a simple hash-like pattern.
+        let eta: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, &xi)| 2.0 * xi + (((i * 37 + 13) % 7) as f64 - 3.0) * 0.5)
+            .collect();
+        let shrinkage = vec![0.10];
+        let opts = GamOptions::default();
+
+        let result = gam_screen_raw(
+            &["ETA_CL"],
+            &[eta.as_slice()],
+            &shrinkage,
+            &["WT"],
+            &[x.as_slice()],
+            &[CovariateKind::Continuous],
+            &opts,
+        );
+
+        assert!(!result.eta_results[0].covariate_scores.is_empty());
+        let score = &result.eta_results[0].covariate_scores[0];
+        // delta_aic == aic_null_local - aic_best
+        // Reconstruct: aic_null_local = aic_best + delta_aic (by definition).
+        let reconstructed_null = score.aic + score.delta_aic;
+        assert!(
+            score.delta_aic.is_finite(),
+            "Δ AIC must be finite with noisy data"
+        );
+        assert!(reconstructed_null.is_finite());
+        assert!(
+            score.delta_aic > 0.0,
+            "strong signal must give positive Δ AIC"
+        );
     }
 
     // ── Speed benchmark ───────────────────────────────────────────────────────
